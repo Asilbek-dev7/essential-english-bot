@@ -1,0 +1,9 @@
+run = "python -m bot.main"
+entrypoint = "bot/main.py"
+
+[env]
+PYTHONUNBUFFERED = "1"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
