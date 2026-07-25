@@ -1,5 +1,6 @@
 run = "python -m bot.main"
 entrypoint = "bot/main.py"
+modules = ["python-3.12"]
 
 [env]
 PYTHONUNBUFFERED = "1"
@@ -7,3 +8,6 @@ PYTHONUNBUFFERED = "1"
 [[ports]]
 localPort = 8080
 externalPort = 80
+
+[nix]
+channel = "stable-25_05"
