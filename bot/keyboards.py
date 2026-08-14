@@ -32,8 +32,18 @@ def ranges_kb(book_id: int, ranges: list[tuple[int, int]]) -> InlineKeyboardMark
     b = InlineKeyboardBuilder()
     for start, end in ranges:
         b.button(text=f"{start}–{end}", callback_data=f"range:{book_id}:{start}:{end}")
+    b.button(text="🔹 Bitta Unit tanlash", callback_data=f"singleunits:{book_id}")
     b.button(text="⬅️ Orqaga", callback_data="back_to_books")
     b.adjust(2)
+    return b.as_markup()
+
+
+def single_units_kb(book_id: int, unit_numbers: list[int]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for n in unit_numbers:
+        b.button(text=f"Unit {n}", callback_data=f"range:{book_id}:{n}:{n}")
+    b.button(text="⬅️ Orqaga", callback_data=f"book:{book_id}")
+    b.adjust(4)
     return b.as_markup()
 
 

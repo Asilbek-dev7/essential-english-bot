@@ -15,6 +15,7 @@ from bot.keyboards import (
     options_kb,
     ranges_kb,
     restart_kb,
+    single_units_kb,
 )
 
 router = Router(name="user")
@@ -149,6 +150,20 @@ async def choose_book(callback: CallbackQuery):
         return
     await callback.message.edit_text(
         "Unit diapazonini tanlang:", reply_markup=ranges_kb(book_id, ranges)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("singleunits:"))
+async def choose_single_unit_menu(callback: CallbackQuery):
+    book_id = int(callback.data.split(":")[1])
+    units = await db.list_units(book_id)
+    if not units:
+        await callback.answer("Bu kitobda hali unit yo'q.", show_alert=True)
+        return
+    unit_numbers = sorted(u["number"] for u in units)
+    await callback.message.edit_text(
+        "Bitta unitni tanlang:", reply_markup=single_units_kb(book_id, unit_numbers)
     )
     await callback.answer()
 
