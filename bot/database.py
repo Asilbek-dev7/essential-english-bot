@@ -1,10 +1,12 @@
+import json
 import random
+import re
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
 
-from bot.config import DB_PATH
+from bot.config import DB_PATH, RU_TRANSLATIONS_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS books (
@@ -39,6 +41,12 @@ CREATE TABLE IF NOT EXISTS user_stats (
     correct INTEGER NOT NULL DEFAULT 0,
     wrong   INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS quiz_sessions (
+    telegram_id INTEGER PRIMARY KEY,
+    data        TEXT NOT NULL,
+    updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # columns added after the initial release; applied to existing DBs via ALTER TABLE
@@ -53,6 +61,16 @@ _BOOKS_EXTRA_COLUMNS = {
     "position": "INTEGER",
 }
 
+_WORDS_EXTRA_COLUMNS = {
+    "translation_ru": "TEXT",
+}
+
+_USERS_EXTRA_COLUMNS = {
+    "lang": "TEXT NOT NULL DEFAULT 'uz'",
+}
+
+LANGS = ("uz", "ru")
+
 
 class Database:
     def __init__(self, path: str = DB_PATH):
@@ -63,18 +81,90 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("PRAGMA foreign_keys = ON;")
             await db.executescript(SCHEMA)
-            cur = await db.execute("PRAGMA table_info(user_stats)")
-            existing_columns = {row[1] for row in await cur.fetchall()}
-            for name, col_type in _USER_STATS_EXTRA_COLUMNS.items():
-                if name not in existing_columns:
-                    await db.execute(f"ALTER TABLE user_stats ADD COLUMN {name} {col_type}")
+            for table, extra in (
+                ("user_stats", _USER_STATS_EXTRA_COLUMNS),
+                ("books", _BOOKS_EXTRA_COLUMNS),
+                ("words", _WORDS_EXTRA_COLUMNS),
+                ("users", _USERS_EXTRA_COLUMNS),
+            ):
+                cur = await db.execute(f"PRAGMA table_info({table})")
+                existing_columns = {row[1] for row in await cur.fetchall()}
+                for name, col_type in extra.items():
+                    if name not in existing_columns:
+                        await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+            await db.execute(
+                "DELETE FROM quiz_sessions WHERE updated_at < datetime('now', '-7 days')"
+            )
+            await db.commit()
+        await self.apply_ru_translations()
 
-            cur = await db.execute("PRAGMA table_info(books)")
-            existing_columns = {row[1] for row in await cur.fetchall()}
-            for name, col_type in _BOOKS_EXTRA_COLUMNS.items():
-                if name not in existing_columns:
-                    await db.execute(f"ALTER TABLE books ADD COLUMN {name} {col_type}")
+    async def apply_ru_translations(self):
+        """Fill translation_ru from data/ru_translations.txt (book|unit|word|ru) where still empty."""
+        if not RU_TRANSLATIONS_PATH.exists():
+            return
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM words WHERE translation_ru IS NULL")
+            if (await cur.fetchone())[0] == 0:
+                return
+            cur = await db.execute("SELECT id, name FROM books")
+            book_ids = {}
+            for book_id, name in await cur.fetchall():
+                m = re.search(r"(\d+)\s*$", name)
+                if m:
+                    book_ids[int(m.group(1))] = book_id
+            rows = []
+            for line in RU_TRANSLATIONS_PATH.read_text(encoding="utf-8").splitlines():
+                parts = line.split("|", 3)
+                if len(parts) != 4 or not parts[0].isdigit() or not parts[1].isdigit():
+                    continue
+                book_id = book_ids.get(int(parts[0]))
+                if book_id is not None:
+                    rows.append((parts[3].strip(), parts[2].strip(), book_id, int(parts[1])))
+            await db.executemany(
+                """UPDATE words SET translation_ru = ?
+                   WHERE translation_ru IS NULL AND word = ?
+                     AND unit_id = (SELECT id FROM units WHERE book_id = ? AND number = ?)""",
+                rows,
+            )
+            await db.commit()
 
+    # ---------- quiz sessions (survive bot restarts) ----------
+
+    async def save_session(self, telegram_id: int, session: dict):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """INSERT INTO quiz_sessions (telegram_id, data, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(telegram_id) DO UPDATE SET
+                       data = excluded.data, updated_at = CURRENT_TIMESTAMP""",
+                (telegram_id, json.dumps(session, ensure_ascii=False)),
+            )
+            await db.commit()
+
+    async def load_session(self, telegram_id: int) -> Optional[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT data FROM quiz_sessions WHERE telegram_id = ?", (telegram_id,)
+            )
+            row = await cur.fetchone()
+        return json.loads(row[0]) if row else None
+
+    async def delete_session(self, telegram_id: int):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM quiz_sessions WHERE telegram_id = ?", (telegram_id,))
+            await db.commit()
+
+    # ---------- user language ----------
+
+    async def get_user_lang(self, telegram_id: int) -> str:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT lang FROM users WHERE telegram_id = ?", (telegram_id,))
+            row = await cur.fetchone()
+            return row[0] if row and row[0] in LANGS else "uz"
+
+    async def set_user_lang(self, telegram_id: int, lang: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE users SET lang = ? WHERE telegram_id = ?", (lang, telegram_id))
             await db.commit()
 
     # ---------- users ----------
@@ -220,12 +310,14 @@ class Database:
 
     # ---------- words ----------
 
-    async def add_word(self, unit_id: int, word: str, translation: str) -> int:
+    async def add_word(
+        self, unit_id: int, word: str, translation: str, translation_ru: Optional[str] = None
+    ) -> int:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("PRAGMA foreign_keys = ON;")
             cur = await db.execute(
-                "INSERT INTO words (unit_id, word, translation) VALUES (?, ?, ?)",
-                (unit_id, word, translation),
+                "INSERT INTO words (unit_id, word, translation, translation_ru) VALUES (?, ?, ?, ?)",
+                (unit_id, word, translation, translation_ru),
             )
             await db.commit()
             return cur.lastrowid
@@ -236,11 +328,13 @@ class Database:
             cur = await db.execute("SELECT * FROM words WHERE id = ?", (word_id,))
             return await cur.fetchone()
 
-    async def update_word(self, word_id: int, word: str, translation: str):
+    async def update_word(
+        self, word_id: int, word: str, translation: str, translation_ru: Optional[str] = None
+    ):
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "UPDATE words SET word = ?, translation = ? WHERE id = ?",
-                (word, translation, word_id),
+                "UPDATE words SET word = ?, translation = ?, translation_ru = ? WHERE id = ?",
+                (word, translation, translation_ru, word_id),
             )
             await db.commit()
 
@@ -272,17 +366,27 @@ class Database:
             return list(await cur.fetchall())
 
     async def random_wrong_translations(
-        self, book_id: int, exclude_word_id: int, count: int
+        self,
+        book_id: int,
+        exclude_word_id: int,
+        count: int,
+        lang: str = "uz",
+        exclude_text: Optional[str] = None,
     ) -> list[str]:
+        column = (
+            "COALESCE(NULLIF(w.translation_ru, ''), w.translation)"
+            if lang == "ru"
+            else "w.translation"
+        )
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT DISTINCT w.translation FROM words w
-                   JOIN units u ON u.id = w.unit_id
-                   WHERE u.book_id = ? AND w.id != ?""",
+                f"""SELECT DISTINCT {column} AS tr FROM words w
+                    JOIN units u ON u.id = w.unit_id
+                    WHERE u.book_id = ? AND w.id != ?""",
                 (book_id, exclude_word_id),
             )
-            rows = [r["translation"] for r in await cur.fetchall()]
+            rows = [r["tr"] for r in await cur.fetchall() if r["tr"] != exclude_text]
         random.shuffle(rows)
         if len(rows) >= count:
             return rows[:count]
@@ -290,9 +394,12 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT DISTINCT translation FROM words WHERE id != ?", (exclude_word_id,)
+                f"SELECT DISTINCT {column} AS tr FROM words w WHERE w.id != ?",
+                (exclude_word_id,),
             )
-            all_rows = [r["translation"] for r in await cur.fetchall() if r["translation"] not in rows]
+            all_rows = [
+                r["tr"] for r in await cur.fetchall() if r["tr"] not in rows and r["tr"] != exclude_text
+            ]
         random.shuffle(all_rows)
         return (rows + all_rows)[:count]
 

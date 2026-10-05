@@ -174,11 +174,22 @@ async def adm_add_word_text(message: Message, state: FSMContext):
 
 @router.message(AdminStates.add_word_translation)
 async def adm_add_word_translation(message: Message, state: FSMContext):
-    data = await state.get_data()
-    translation = message.text.strip()
-    await db.add_word(data["unit_id"], data["word"], translation)
+    await state.update_data(translation=message.text.strip())
+    await state.set_state(AdminStates.add_word_translation_ru)
     await message.answer(
-        f"✅ So'z qo'shildi:\n\n{data['word']} — {translation}", reply_markup=admin_menu_kb()
+        "Ruscha tarjimasini kiriting (o'tkazib yuborish uchun - yuboring):",
+        reply_markup=admin_cancel_kb(),
+    )
+
+
+@router.message(AdminStates.add_word_translation_ru)
+async def adm_add_word_translation_ru(message: Message, state: FSMContext):
+    data = await state.get_data()
+    translation_ru = None if message.text.strip() == "-" else message.text.strip()
+    await db.add_word(data["unit_id"], data["word"], data["translation"], translation_ru)
+    await message.answer(
+        f"✅ So'z qo'shildi:\n\n{data['word']} — {data['translation']}\n🇷🇺 {translation_ru or '—'}",
+        reply_markup=admin_menu_kb(),
     )
     await state.clear()
 
@@ -228,7 +239,10 @@ async def adm_word_detail(callback: CallbackQuery):
     if word is None:
         await callback.answer("So'z topilmadi.", show_alert=True)
         return
-    text = f"Word:\n{word['word']}\n\nTranslation:\n{word['translation']}"
+    text = (
+        f"Word:\n{word['word']}\n\nTranslation:\n{word['translation']}\n\n"
+        f"Перевод:\n{word['translation_ru'] or '—'}"
+    )
     await callback.message.edit_text(
         text, reply_markup=admin_word_detail_kb(word_id, word["unit_id"])
     )
@@ -259,11 +273,24 @@ async def adm_word_edit_text(message: Message, state: FSMContext):
 
 @router.message(AdminStates.edit_word_translation)
 async def adm_word_edit_translation(message: Message, state: FSMContext):
-    data = await state.get_data()
-    translation = message.text.strip()
-    await db.update_word(data["word_id"], data["word"], translation)
+    await state.update_data(translation=message.text.strip())
+    await state.set_state(AdminStates.edit_word_translation_ru)
     await message.answer(
-        f"✅ So'z yangilandi:\n\n{data['word']} — {translation}", reply_markup=admin_menu_kb()
+        "Yangi ruscha tarjimani kiriting (o'zgartirmaslik uchun - yuboring):",
+        reply_markup=admin_cancel_kb(),
+    )
+
+
+@router.message(AdminStates.edit_word_translation_ru)
+async def adm_word_edit_translation_ru(message: Message, state: FSMContext):
+    data = await state.get_data()
+    current = await db.get_word(data["word_id"])
+    keep = message.text.strip() == "-"
+    translation_ru = (current["translation_ru"] if current else None) if keep else message.text.strip()
+    await db.update_word(data["word_id"], data["word"], data["translation"], translation_ru)
+    await message.answer(
+        f"✅ So'z yangilandi:\n\n{data['word']} — {data['translation']}\n🇷🇺 {translation_ru or '—'}",
+        reply_markup=admin_menu_kb(),
     )
     await state.clear()
 
@@ -302,8 +329,8 @@ async def adm_bulk_import_book_chosen(callback: CallbackQuery, state: FSMContext
     await callback.message.edit_text(
         "So'zlarni qo'shishning ikki yo'li bor:\n\n"
         "1️⃣ <b>Matn / .txt fayl</b> — har bir qatorda:\n"
-        "<code>unit|so'z|tarjima</code>\n"
-        "Masalan:\n<code>4|abandon|tark etmoq\n4|benefit|foyda</code>\n\n"
+        "<code>unit|so'z|tarjima|ruscha (ixtiyoriy)</code>\n"
+        "Masalan:\n<code>4|abandon|tark etmoq|покидать\n4|benefit|foyda</code>\n\n"
         "2️⃣ <b>Kitobning PDF fayli</b> — shunchaki PDF faylni shu yerga yuboring, "
         "bot o'zi matnni o'qib, so'z va tarjimalarni aniqlashga harakat qiladi "
         "(qo'shishdan oldin natijani ko'rsatib, tasdiqlashingizni so'raydi).",
@@ -344,12 +371,13 @@ async def adm_bulk_import_process(message: Message, state: FSMContext, bot: Bot)
         if not line:
             continue
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) != 3 or not parts[0].isdigit() or not parts[1] or not parts[2]:
+        if len(parts) not in (3, 4) or not parts[0].isdigit() or not parts[1] or not parts[2]:
             errors.append(i)
             continue
         unit_number, word, translation = int(parts[0]), parts[1], parts[2]
+        translation_ru = parts[3] or None if len(parts) == 4 else None
         unit_id = await db.get_or_create_unit(book_id, unit_number)
-        await db.add_word(unit_id, word, translation)
+        await db.add_word(unit_id, word, translation, translation_ru)
         added += 1
 
     summary = f"✅ {added} ta so'z qo'shildi."

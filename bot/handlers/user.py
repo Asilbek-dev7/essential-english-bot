@@ -1,4 +1,7 @@
+import html
+import logging
 import random
+from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
@@ -10,6 +13,7 @@ from bot.keyboards import (
     admin_menu_kb,
     book_list_reply_kb,
     count_kb,
+    lang_kb,
     main_menu_reply_kb,
     next_question_kb,
     options_kb,
@@ -18,10 +22,31 @@ from bot.keyboards import (
     single_units_kb,
 )
 
+logger = logging.getLogger(__name__)
+
 router = Router(name="user")
 
 # telegram_id -> quiz session dict, kept in memory for the lifetime of the process
 SESSIONS: dict[int, dict] = {}
+
+
+async def get_session(user_id: int) -> dict | None:
+    """Memory first; fall back to the DB copy (e.g. after a bot restart)."""
+    session = SESSIONS.get(user_id)
+    if session is None:
+        session = await db.load_session(user_id)
+        if session is not None:
+            SESSIONS[user_id] = session
+    return session
+
+
+async def save_session(user_id: int):
+    await db.save_session(user_id, SESSIONS[user_id])
+
+
+async def drop_session(user_id: int):
+    SESSIONS.pop(user_id, None)
+    await db.delete_session(user_id)
 
 
 async def send_books_list(message: Message):
@@ -43,7 +68,7 @@ async def is_book_name(message: Message) -> bool:
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await db.get_or_create_user(message.from_user.id, message.from_user.username)
-    SESSIONS.pop(message.from_user.id, None)
+    await drop_session(message.from_user.id)
     is_admin = message.from_user.id in ADMIN_IDS
     await message.answer(
         "👋 Xush kelibsiz!\n\n"
@@ -56,7 +81,7 @@ async def cmd_start(message: Message):
 
 @router.message(F.text == "📚 Kitoblar")
 async def menu_books(message: Message):
-    SESSIONS.pop(message.from_user.id, None)
+    await drop_session(message.from_user.id)
     await send_books_list(message)
 
 
@@ -88,12 +113,41 @@ async def menu_stats(message: Message):
     await message.answer(text)
 
 
+LANG_NAMES = {"uz": "🇺🇿 O'zbekcha", "ru": "🇷🇺 Русский"}
+
+
+@router.message(F.text == "🌐 Til / Язык")
+async def menu_lang(message: Message):
+    await db.get_or_create_user(message.from_user.id, message.from_user.username)
+    current = await db.get_user_lang(message.from_user.id)
+    await message.answer(
+        "🌐 So'zlar tarjimasi tilini tanlang / Выберите язык перевода слов:\n\n"
+        f"Hozirgi / Текущий: {LANG_NAMES[current]}",
+        reply_markup=lang_kb(current),
+    )
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def choose_lang(callback: CallbackQuery):
+    lang = callback.data.split(":")[1]
+    if lang not in LANG_NAMES:
+        await callback.answer()
+        return
+    await db.get_or_create_user(callback.from_user.id, callback.from_user.username)
+    await db.set_user_lang(callback.from_user.id, lang)
+    await callback.message.edit_text(
+        f"✅ Til o'zgartirildi / Язык изменён: {LANG_NAMES[lang]}", reply_markup=lang_kb(lang)
+    )
+    await callback.answer()
+
+
 @router.message(F.text == "ℹ️ Yordam")
 async def menu_help(message: Message):
     text = (
         "ℹ️ Yordam\n\n"
         "📚 Kitoblar — kitob, Unit diapazoni va savollar sonini tanlab, test yeching\n"
         "📊 Natijalarim — barcha vaqtdagi statistikangiz va oxirgi natijangiz\n"
+        "🌐 Til / Язык — tarjima tilini tanlash (o'zbekcha yoki ruscha)\n"
         "/start — botni qayta ishga tushirish\n\n"
         "So'zlar va javob variantlari har safar random tartibda chiqadi. "
         "Test paytida 4 ta variantdan birini tanlang. Har javobdan keyin "
@@ -119,7 +173,7 @@ async def menu_back(message: Message):
 
 @router.message(is_book_name)
 async def book_selected(message: Message):
-    SESSIONS.pop(message.from_user.id, None)
+    await drop_session(message.from_user.id)
     book = await db.get_book_by_name(message.text)
     is_admin = message.from_user.id in ADMIN_IDS
     ranges = await db.get_unit_ranges(book["id"], UNIT_RANGE_SIZE)
@@ -199,7 +253,7 @@ async def start_quiz(
     if not words:
         await callback.answer("Bu diapazonda so'zlar topilmadi.", show_alert=True)
         return
-    remaining = list(words)
+    remaining = [dict(w) for w in words]
     random.shuffle(remaining)
     if question_count is not None:
         remaining = remaining[:question_count]
@@ -214,7 +268,11 @@ async def start_quiz(
         "total": 0,
         "correct": 0,
         "wrong": 0,
+        "user_name": callback.from_user.full_name,
+        "username": callback.from_user.username,
+        "lang": await db.get_user_lang(callback.from_user.id),
     }
+    await save_session(callback.from_user.id)
     await callback.answer()
     await ask_next_question(callback.message, callback.from_user.id)
 
@@ -223,25 +281,35 @@ async def build_question(user_telegram_id: int) -> dict:
     session = SESSIONS[user_telegram_id]
     session["asked"] += 1
     word_row = session["remaining"].pop()
+    lang = session["lang"]
+    translation_ru = word_row["translation_ru"] or word_row["translation"]
+    correct_text = translation_ru if lang == "ru" else word_row["translation"]
     wrong = await db.random_wrong_translations(
-        session["book_id"], word_row["id"], QUESTION_OPTIONS_COUNT - 1
+        session["book_id"],
+        word_row["id"],
+        QUESTION_OPTIONS_COUNT - 1,
+        lang=lang,
+        exclude_text=correct_text,
     )
-    options = [word_row["translation"]] + wrong
+    options = [correct_text] + wrong
     random.shuffle(options)
-    correct_index = options.index(word_row["translation"])
+    correct_index = options.index(correct_text)
     question = {
         "word_id": word_row["id"],
         "word": word_row["word"],
-        "translation": word_row["translation"],
+        "translation": correct_text,
+        "translation_uz": word_row["translation"],
+        "translation_ru": translation_ru,
         "options": options,
         "correct_index": correct_index,
     }
     session["current"] = question
+    await save_session(user_telegram_id)
     return question
 
 
 async def ask_next_question(message: Message, user_telegram_id: int):
-    session = SESSIONS.get(user_telegram_id)
+    session = await get_session(user_telegram_id)
     if session is None:
         return
 
@@ -258,8 +326,31 @@ async def ask_next_question(message: Message, user_telegram_id: int):
     await message.edit_text(text, reply_markup=options_kb(question["options"]), parse_mode="HTML")
 
 
+async def notify_admins(bot, user_telegram_id: int, session: dict, total: int, correct: int, wrong: int, percent: int):
+    book = await db.get_book(session["book_id"])
+    book_name = book["name"] if book else "?"
+    unit_from, unit_to = session["unit_from"], session["unit_to"]
+    units = f"Unit {unit_from}" if unit_from == unit_to else f"Unit {unit_from}–{unit_to}"
+    username = f"@{session['username']}" if session.get("username") else "—"
+    text = (
+        "📩 <b>Yangi natija</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"👤 {html.escape(session.get('user_name') or '—')} ({html.escape(username)})\n"
+        f"🆔 <code>{user_telegram_id}</code>\n"
+        f"📚 {html.escape(book_name)} — {units}\n"
+        f"🎯 Natija: {correct}/{total} ({percent}%)\n"
+        f"✅ {correct}   ❌ {wrong}\n"
+        f"🕓 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning(f"Adminga ({admin_id}) hisobot yuborib bo'lmadi: {e}")
+
+
 async def finish_quiz(message: Message, user_telegram_id: int):
-    session = SESSIONS.get(user_telegram_id)
+    session = await get_session(user_telegram_id)
     if session is None:
         return
     total = session["total"]
@@ -267,7 +358,10 @@ async def finish_quiz(message: Message, user_telegram_id: int):
     wrong = session["wrong"]
     percent = round(correct / total * 100) if total else 0
 
+    # drop first: a double tap on "next" must not record the result twice
+    await drop_session(user_telegram_id)
     await db.add_user_result(user_telegram_id, correct, wrong)
+    await notify_admins(message.bot, user_telegram_id, session, total, correct, wrong, percent)
 
     text = (
         "🎉 Tabriklaymiz! Siz tanlangan Unit(lar)ni yakunladingiz.\n\n"
@@ -288,7 +382,7 @@ async def finish_quiz(message: Message, user_telegram_id: int):
 
 @router.callback_query(F.data.startswith("ans:"))
 async def answer_question(callback: CallbackQuery):
-    session = SESSIONS.get(callback.from_user.id)
+    session = await get_session(callback.from_user.id)
     if session is None or session["current"] is None:
         await callback.answer("Sessiya topilmadi. /start ni bosing.", show_alert=True)
         return
@@ -297,25 +391,30 @@ async def answer_question(callback: CallbackQuery):
     question = session["current"]
     session["total"] += 1
 
+    both_langs = (
+        f"🇺🇿 {html.escape(question['translation_uz'], quote=False)}\n"
+        f"🇷🇺 {html.escape(question['translation_ru'], quote=False)}"
+    )
     if chosen_index == question["correct_index"]:
         session["correct"] += 1
-        text = f"✅ To'g'ri!\n\n<b>{question['word']}</b> — {question['translation']}"
+        text = f"✅ To'g'ri!\n\n<b>{question['word']}</b>\n{both_langs}"
     else:
         session["wrong"] += 1
         correct_letter = chr(65 + question["correct_index"])
         text = (
             f"❌ Noto'g'ri.\n\n<b>{question['word']}</b>\n\n"
-            f"To'g'ri javob:\n{correct_letter}) {question['translation']}"
+            f"To'g'ri javob: {correct_letter})\n{both_langs}"
         )
 
     session["current"] = None
+    await save_session(callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=next_question_kb())
     await callback.answer()
 
 
 @router.callback_query(F.data == "next")
 async def next_question(callback: CallbackQuery):
-    session = SESSIONS.get(callback.from_user.id)
+    session = await get_session(callback.from_user.id)
     if session is None:
         await callback.answer("Sessiya topilmadi. /start ni bosing.", show_alert=True)
         return

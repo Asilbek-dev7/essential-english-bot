@@ -13,6 +13,7 @@ def main_menu_reply_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="📚 Kitoblar")],
         [KeyboardButton(text="📊 Natijalarim"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="🌐 Til / Язык")],
     ]
     if is_admin:
         rows.append([KeyboardButton(text="🛠 Admin panel")])
@@ -58,6 +59,14 @@ def count_kb(book_id: int, unit_from: int, unit_to: int, available: int) -> Inli
     )
     b.button(text="⬅️ Orqaga", callback_data=f"book:{book_id}")
     b.adjust(3)
+    return b.as_markup()
+
+
+def lang_kb(current: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=("✅ " if current == "uz" else "") + "🇺🇿 O'zbekcha", callback_data="lang:uz")
+    b.button(text=("✅ " if current == "ru" else "") + "🇷🇺 Русский", callback_data="lang:ru")
+    b.adjust(1)
     return b.as_markup()
 
 

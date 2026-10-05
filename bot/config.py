@@ -16,5 +16,7 @@ ADMIN_IDS = {
 
 DB_PATH = str(BASE_DIR / os.getenv("DB_PATH", "data/bot.db"))
 
+RU_TRANSLATIONS_PATH = BASE_DIR / "data" / "ru_translations.txt"
+
 UNIT_RANGE_SIZE = 5
 QUESTION_OPTIONS_COUNT = 4
